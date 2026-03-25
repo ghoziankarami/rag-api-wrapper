@@ -1,0 +1,18 @@
+{
+  "name": "rag-api-wrapper",
+  "version": "1.0.0",
+  "description": "RAG API Wrapper for Vercel RAG Dashboard to access Vector DB on VPS",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "keywords": ["rag", "api", "vector-db", "wrapper"],
+  "author": "Orebit",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "express-rate-limit": "^7.2.0"
+  }
+}
