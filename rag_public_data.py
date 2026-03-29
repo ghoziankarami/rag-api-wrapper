@@ -39,6 +39,7 @@ PAPERS_DB = WORKSPACE / '.vector_db' / 'papers'
 PAPERS_COLLECTION = 'papers'
 SUMMARIES_COLLECTION = 'papers_summary'
 OBSIDIAN_PAPERS_DIR = Path('/data/obsidian/3. Resources/Papers')
+TRACKER_PATH = WORKSPACE / 'research' / 'paper-tracker' / 'papers.json'
 OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'stepfun/step-3.5-flash:free')
 OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions'
 
@@ -287,6 +288,45 @@ def extract_note_record(path: Path) -> dict[str, Any] | None:
     }
 
 
+def load_tracker_pending_records() -> list[dict[str, Any]]:
+    if not TRACKER_PATH.exists():
+        return []
+    try:
+        rows = json.loads(TRACKER_PATH.read_text())
+    except Exception:
+        return []
+
+    records = []
+    for row in rows:
+        if row.get('status') != 'pending':
+            continue
+        title = normalize_title_text(row.get('title') or row.get('id') or 'Untitled')
+        authors_list = parse_author_list(row.get('authors'))
+        citation = build_apa_citation(title, authors_list or row.get('authors'), row.get('year'))
+        blocker = str(row.get('pending_reason') or 'pending').replace('_', ' ')
+        source_url = row.get('source_url') or row.get('pdf_url') or row.get('download_url')
+        records.append({
+            'id': normalize_key(row.get('doi') or title or row.get('id')),
+            'source': source_url or row.get('id'),
+            'title': title,
+            'display_title': citation,
+            'citation': citation,
+            'authors': format_apa_authors(authors_list) or normalize_title_text(row.get('authors')),
+            'authors_list': authors_list,
+            'year': row.get('year'),
+            'doi': row.get('doi'),
+            'snippet': f"Approved paper pending full-text download. Current blocker: {blocker}.",
+            'kind': 'pending_metadata',
+            'generated_at': row.get('downloaded_date') or row.get('resolver_last_attempt_at'),
+            'pending_reason': row.get('pending_reason'),
+            'url': source_url,
+            'source_ref': source_url,
+            'has_summary': False,
+            'chunk_count': 0,
+        })
+    return records
+
+
 class PaperRagStore:
     def __init__(self, db_path: Path = PAPERS_DB):
         self.db_path = db_path
@@ -450,7 +490,21 @@ class PaperRagStore:
                 'kind': 'summary',
                 'chunk_count': 0,
                 'has_summary': True,
+                'url': summary.get('url') or summary.get('source_ref'),
+                'source_ref': summary.get('source_ref') or summary.get('url'),
             }
+
+        existing_dois = {str((p.get('doi') or '')).lower() for p in papers.values() if p.get('doi')}
+        for pending in load_tracker_pending_records():
+            pending_doi = str((pending.get('doi') or '')).lower()
+            pending_key = pending.get('id')
+            if pending_key in papers:
+                continue
+            if pending_doi and pending_doi in existing_dois:
+                continue
+            papers[pending_key] = pending
+            if pending_doi:
+                existing_dois.add(pending_doi)
 
         ordered = sorted(
             papers.values(),
