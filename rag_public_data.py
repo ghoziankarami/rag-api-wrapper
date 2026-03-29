@@ -466,13 +466,17 @@ class PaperRagStore:
         papers = self.papers()
         summary_count = len(self.summary_index())
         chunk_count = self.count(PAPERS_COLLECTION)
+        fulltext_papers = len([p for p in papers if (p.get('chunk_count') or 0) > 0])
+        metadata_only_records = len([p for p in papers if (p.get('chunk_count') or 0) == 0])
         return {
             'status': 'ok',
             'service': 'rag-api-wrapper',
             'version': '2.0.0',
             'mode': 'public_read_only',
             'indexed_papers': len(papers),
-            'paper_count': len([p for p in papers if p.get('kind') == 'paper' or p.get('has_summary')]),
+            'paper_count': fulltext_papers,
+            'fulltext_papers': fulltext_papers,
+            'metadata_only_records': metadata_only_records,
             'summary_count': summary_count,
             'collection_count': chunk_count,
             'timestamp': datetime.now(timezone.utc).isoformat(),
