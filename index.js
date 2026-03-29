@@ -8,6 +8,9 @@ const path = require('path')
 const app = express()
 const PORT = Number(process.env.PORT || 3004)
 const DATA_PROVIDER = path.join(__dirname, 'rag_public_data.py')
+const STATS_TTL_MS = Number(process.env.RAG_STATS_TTL_MS || 60_000)
+
+app.set('trust proxy', 1)
 
 // Security: API Key (environment variable)
 const API_KEY = process.env.RAG_API_KEY || 'default-secret-key-change-me'
@@ -23,7 +26,18 @@ app.use(cors())
 app.use(limiter)
 app.use(express.json({ limit: '1mb' }))
 
+function isLoopbackRequest(req) {
+  const socketIp = req.socket?.remoteAddress || ''
+  const forwardedIp = req.ip || ''
+  const loopbacks = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
+  return loopbacks.has(socketIp) || loopbacks.has(forwardedIp)
+}
+
 function validateApiKey(req, res, next) {
+  if (isLoopbackRequest(req)) {
+    return next()
+  }
+
   const providedKey = req.headers['x-api-key']
 
   if (!providedKey || providedKey !== API_KEY) {
@@ -34,6 +48,11 @@ function validateApiKey(req, res, next) {
 }
 
 app.use('/api/rag', validateApiKey)
+
+const statsCache = {
+  data: null,
+  expiresAt: 0,
+}
 
 function runProvider(command, args = []) {
   const output = execFileSync('python3', [DATA_PROVIDER, command, ...args], {
@@ -53,6 +72,18 @@ function runProvider(command, args = []) {
   } catch (error) {
     throw new Error(`Invalid JSON from data provider: ${trimmed.slice(0, 400)}`)
   }
+}
+
+function getStatsCached({ force = false } = {}) {
+  const now = Date.now()
+  if (!force && statsCache.data && statsCache.expiresAt > now) {
+    return statsCache.data
+  }
+
+  const data = runProvider('stats')
+  statsCache.data = data
+  statsCache.expiresAt = now + STATS_TTL_MS
+  return data
 }
 
 app.post('/api/rag/search', (req, res) => {
@@ -90,7 +121,8 @@ app.get('/api/rag/browse', (req, res) => {
 
 app.get('/api/rag/stats', (req, res) => {
   try {
-    const data = runProvider('stats')
+    const force = req.query.refresh === '1'
+    const data = getStatsCached({ force })
     return res.json(data)
   } catch (err) {
     console.error('[RAG API] Stats error:', err)
@@ -116,7 +148,7 @@ app.post('/api/rag/answer', (req, res) => {
 
 app.get('/api/rag/health', (req, res) => {
   try {
-    const stats = runProvider('stats')
+    const stats = getStatsCached()
     return res.json({
       status: 'healthy',
       service: 'rag-api-wrapper',
@@ -129,6 +161,7 @@ app.get('/api/rag/health', (req, res) => {
         summary_count: stats.summary_count || 0,
         collection_count: stats.collection_count || 0,
       },
+      cache_ttl_ms: STATS_TTL_MS,
     })
   } catch (err) {
     console.error('[RAG API] Health error:', err)

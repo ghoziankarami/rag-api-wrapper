@@ -22,12 +22,16 @@ import json
 import os
 import re
 import sys
+import warnings
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import chromadb
+from requests.exceptions import RequestsDependencyWarning
+
+warnings.filterwarnings('ignore', category=RequestsDependencyWarning)
 import requests
 
 WORKSPACE = Path('/root/.openclaw/workspace')
