@@ -40,10 +40,33 @@ PAPERS_COLLECTION = 'papers'
 SUMMARIES_COLLECTION = 'papers_summary'
 OBSIDIAN_PAPERS_DIR = Path('/data/obsidian/3. Resources/Papers')
 TRACKER_PATH = WORKSPACE / 'research' / 'paper-tracker' / 'papers.json'
-OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'stepfun/step-3.5-flash:free')
-OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions'
+ZAI_MODEL = os.getenv('ZAI_MODEL', 'glm-4.7')
+ZAI_URL = os.getenv('ZAI_URL', 'https://api.z.ai/api/coding/paas/v4/chat/completions')
+
+FOLLOWUP_PRONOUNS = {
+    'it', 'its', 'they', 'them', 'their', 'theirs', 'this', 'that', 'these', 'those',
+    'he', 'she', 'his', 'her', 'hers', 'former', 'latter'
+}
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.I)
+
+# Stopwords — common English words that add noise to keyword scoring
+STOPWORDS = frozenset({
+    'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+    'should', 'may', 'might', 'shall', 'can', 'need', 'must',
+    'i', 'me', 'my', 'we', 'our', 'you', 'your', 'he', 'she', 'it', 'they',
+    'this', 'that', 'these', 'those', 'what', 'which', 'who', 'whom',
+    'how', 'when', 'where', 'why',
+    'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from', 'as',
+    'into', 'about', 'between', 'through', 'during', 'before', 'after',
+    'and', 'or', 'but', 'not', 'no', 'nor', 'so', 'if', 'then',
+    'up', 'out', 'off', 'over', 'under', 'again', 'further',
+    'all', 'each', 'every', 'both', 'few', 'more', 'most', 'other',
+    'some', 'such', 'only', 'own', 'same', 'than', 'too', 'very',
+    'just', 'also', 'now', 'here', 'there',
+})
+
 TERM_EXPANSIONS = {
     'bouger': ['bouger', 'bouguer'],
     'bouguer': ['bouguer', 'bouger'],
@@ -51,6 +74,11 @@ TERM_EXPANSIONS = {
     'gravity': ['gravity', 'gravimetri', 'gravity anomaly'],
     'anomaly': ['anomaly', 'anomali'],
     'simamora': ['simamora'],
+    'kriging': ['kriging', 'krige', 'geostatistic', 'geostatistics', 'variogram'],
+    'variogram': ['variogram', 'semivariogram', 'kriging', 'geostatistic'],
+    'geostatistic': ['geostatistic', 'geostatistics', 'kriging', 'variogram'],
+    'geostatistics': ['geostatistics', 'geostatistic', 'kriging', 'variogram'],
+    'interpolation': ['interpolation', 'interpolate', 'kriging', 'spatial'],
 }
 
 
@@ -534,13 +562,18 @@ class PaperRagStore:
             'summary_count': summary_count,
             'collection_count': chunk_count,
             'timestamp': datetime.now(timezone.utc).isoformat(),
-            'llm_ready': bool(os.getenv('OPENROUTER_API_KEY')),
+            'llm_ready': bool(os.getenv('ZAI_API_KEY') or os.getenv('OPENCLAW_MODELS_PROVIDERS_ZAI_APIKEY')),
         }
 
     def _tokens(self, text: str) -> list[str]:
         raw = [tok.lower() for tok in TOKEN_RE.findall(text or '') if len(tok) > 1]
+        # Filter stopwords to avoid inflating scores on common words
+        filtered = [tok for tok in raw if tok not in STOPWORDS]
+        # If all tokens were stopwords, fall back to original (minus single chars)
+        if not filtered:
+            filtered = raw
         expanded = []
-        for tok in raw:
+        for tok in filtered:
             expanded.extend(TERM_EXPANSIONS.get(tok, [tok]))
         seen = []
         for tok in expanded:
@@ -552,6 +585,7 @@ class PaperRagStore:
         if not query_tokens:
             return 0.0
         scored = 0.0
+        matched_tokens = 0
         joined = ' \n '.join(fields).lower()
         title = fields[0].lower() if fields else ''
         source = fields[-1].lower() if fields else ''
@@ -559,23 +593,129 @@ class PaperRagStore:
             freq = joined.count(token)
             if not freq:
                 continue
+            matched_tokens += 1
             weight = 1.0
             if token in title:
-                weight += 2.5
-            if token in source:
                 weight += 3.0
+            if token in source:
+                weight += 3.5
             scored += min(6.0, freq) * weight
+        # Require at least some token coverage to score well
+        if not matched_tokens:
+            return 0.0
+        coverage = matched_tokens / len(query_tokens)
         phrase = ' '.join(query_tokens)
         if phrase and phrase in joined:
-            scored += 4.0
+            scored += 5.0
+        if phrase and phrase in title:
+            scored += 8.0
         if phrase and phrase in source:
             scored += 6.0
-        # Normalize into roughly 0..1
-        denom = max(8.0, len(query_tokens) * 6.0)
-        return min(0.99, scored / denom)
+        # Normalize into roughly 0..1, weighted by coverage
+        denom = max(10.0, len(query_tokens) * 7.0)
+        raw_score = min(0.99, scored / denom)
+        # Apply coverage penalty: papers matching only 1 of 3 tokens score lower
+        return round(raw_score * (0.4 + 0.6 * coverage), 4)
 
-    def search(self, query: str, top_k: int = 10) -> list[dict[str, Any]]:
+    def _rewrite_followup_query(self, query: str, history: list | None = None) -> str:
         q = (query or '').strip()
+        if not q or not history:
+            return q
+        tokens = self._tokens(q)
+        if not any(tok in FOLLOWUP_PRONOUNS for tok in [t.lower() for t in TOKEN_RE.findall(q)]):
+            return q
+        # Find the most recent user question with strong domain terms
+        for msg in reversed(history[-6:]):
+            if msg.get('role') != 'user':
+                continue
+            prev = str(msg.get('content') or '').strip()
+            if not prev or prev == q:
+                continue
+            prev_tokens = self._tokens(prev)
+            if len(prev_tokens) < 2:
+                continue
+            return f"{q} (context: {prev})"
+        return q
+
+    def _clean_snippet(self, text: str | None) -> str:
+        raw = trim(text or '', 420)
+        if not raw:
+            return ''
+        cleaned = raw.replace('LLM Summary:', '').replace('Objective:', '').replace('Overview', '').strip(' -:')
+        cleaned = re.sub(r'\[\[[^\]]+\]\]', '', cleaned)
+        cleaned = re.sub(r'(Related Concepts|Citation|Indexed|Source)\s*:?.*', '', cleaned, flags=re.I)
+        cleaned = re.sub(r'\b(Related Concepts|Citation|Indexed|Source)\b.*', '', cleaned, flags=re.I)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip(' -:;,.')
+        return cleaned
+
+    def _extract_definition_line(self, text: str | None, query_tokens: list[str]) -> str:
+        cleaned = self._clean_snippet(text)
+        if not cleaned:
+            return ''
+        sentences = re.split(r'(?<=[.!?])\s+', cleaned)
+        priority = []
+        for s in sentences:
+            s2 = s.strip()
+            low = s2.lower()
+            if any(tok in low for tok in query_tokens) and any(key in low for key in [' is ', ' are ', ' refers to ', ' defined as ', ' method', ' interpolation', ' technique']):
+                priority.append(s2)
+        if priority:
+            return trim(priority[0], 260)
+        return trim(sentences[0] if sentences else cleaned, 260)
+
+    def _rerank_candidates(self, query: str, candidates: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
+        q = (query or '').strip().lower()
+        q_tokens = self._tokens(q)
+        reranked = []
+        for item in candidates:
+            score = float(item.get('score') or 0.0)
+            chunk_count = int(item.get('chunk_count') or 0)
+            title = str(item.get('title') or '').lower()
+            snippet = str(item.get('snippet') or '').lower()
+            kind = str(item.get('kind') or '').lower()
+            year_text = str(item.get('year') or '')
+            year_val = int(year_text) if year_text.isdigit() else 0
+
+            # Strongly prefer papers that have actual full-text chunks / paper records
+            if kind == 'paper':
+                score += 0.10
+            if chunk_count > 0:
+                score += 0.22
+            else:
+                score -= 0.10
+
+            # Prefer title matches for domain / definition questions
+            title_hits = sum(1 for tok in q_tokens if tok in title)
+            score += min(0.24, title_hits * 0.08)
+
+            # Prefer definitional snippets when user asks "what is / what are"
+            if q.startswith('what is') or q.startswith('what are'):
+                if any(key in snippet for key in [' is ', ' are ', 'refers to', 'defined as', 'interpolation', 'geostatistical method']):
+                    score += 0.10
+
+            # Richer snippet bonus
+            if len(snippet) > 180:
+                score += 0.03
+
+            # Slight preference to classic foundational sources for definitions
+            if year_val and year_val <= 2010:
+                score += 0.02
+
+            clean_snippet = self._clean_snippet(item.get('snippet') or '')
+            definition_snippet = self._extract_definition_line(item.get('snippet') or '', q_tokens)
+            item = {
+                **item,
+                'score': round(min(0.99, score), 4),
+                'snippet': clean_snippet,
+                'definition_snippet': definition_snippet,
+            }
+            reranked.append(item)
+
+        reranked.sort(key=lambda item: (item['score'], int(str(item.get('year') or 0)) if str(item.get('year') or '').isdigit() else 0), reverse=True)
+        return reranked[:top_k]
+
+    def search(self, query: str, top_k: int = 10, history: list | None = None) -> list[dict[str, Any]]:
+        q = self._rewrite_followup_query((query or '').strip(), history)
         if not q:
             return []
         tokens = self._tokens(q)
@@ -611,14 +751,15 @@ class PaperRagStore:
                 'has_summary': paper.get('has_summary', False),
             })
 
-        candidates.sort(key=lambda item: (item['score'], str(item.get('year') or '')), reverse=True)
         deduped: dict[str, dict[str, Any]] = {}
         for item in candidates:
             key = normalize_key(item.get('source') or item.get('title') or item['id'])
             existing = deduped.get(key)
             if not existing or item['score'] > existing['score']:
                 deduped[key] = item
-        return list(deduped.values())[:top_k]
+
+        reranked = self._rerank_candidates(q, list(deduped.values()), top_k=max(top_k * 2, 10))
+        return reranked[:top_k]
 
     def browse(self, page: int = 1, limit: int = 24) -> dict[str, Any]:
         page = max(1, int(page or 1))
@@ -636,12 +777,13 @@ class PaperRagStore:
             'papers': rows,
         }
 
-    def answer(self, query: str, top_k: int = 5) -> dict[str, Any]:
-        results = self.search(query, top_k=max(3, min(8, top_k)))
+    def answer(self, query: str, top_k: int = 5, history: list | None = None) -> dict[str, Any]:
+        rewritten_query = self._rewrite_followup_query(query, history)
+        results = self.search(rewritten_query, top_k=max(3, min(8, top_k)), history=history)
         if not results:
             return {
                 'query': query,
-                'answer': 'Saya belum menemukan konteks yang cukup di indeks publik untuk pertanyaan itu.',
+                'answer': 'No relevant papers found in the index for that query.',
                 'sources': [],
                 'llm_used': False,
             }
@@ -649,55 +791,75 @@ class PaperRagStore:
         context_parts = []
         for item in results[:top_k]:
             source_line = item.get('citation') or item.get('display_title') or item.get('title') or item.get('source') or 'Unknown source'
+            best_snippet = item.get('definition_snippet') or item.get('snippet') or '—'
             context_parts.append(
                 f"[Source: {source_line}]\n"
                 f"Authors: {item.get('authors') or '—'}\n"
-                f"Score: {item.get('score')}\n"
-                f"Snippet: {item.get('snippet') or '—'}"
+                f"Year: {item.get('year') or '—'}\n"
+                f"DOI: {item.get('doi') or '—'}\n"
+                f"Evidence: {best_snippet}"
             )
         context = '\n\n---\n\n'.join(context_parts)
 
-        api_key = os.getenv('OPENROUTER_API_KEY')
+        api_key = os.getenv('ZAI_API_KEY') or os.getenv('OPENCLAW_MODELS_PROVIDERS_ZAI_APIKEY')
         if not api_key:
             return {
                 'query': query,
-                'answer': 'LLM belum aktif di environment ini. Context retrieval sudah jalan, tapi API key OpenRouter belum tersedia.',
+                'answer': 'LLM is not active in this environment. Context retrieval works, but the native z.ai API key is not available.',
                 'sources': results[:top_k],
                 'llm_used': False,
             }
+
+        # Build conversation history for follow-up context
+        history_text = ''
+        if history:
+            history_lines = []
+            for msg in history[-6:]:  # Last 6 messages max
+                role = msg.get('role', 'user')
+                content = str(msg.get('content', ''))[:500]  # Truncate long messages
+                history_lines.append(f"{role.upper()}: {content}")
+            if history_lines:
+                history_text = '\n\nConversation history (for follow-up context):\n' + '\n'.join(history_lines)
 
         prompt = (
             'You are the public Orebit RAG assistant.\n'
             'Answer using ONLY the provided paper context.\n'
             'If the context is insufficient, say so plainly.\n'
-            'Reply in the same language as the user, concise but useful, and include the most relevant source titles at the end.\n\n'
-            f'Context:\n{context}\n\n'
-            f'Question: {query}\n'
+            'Write a crisp, useful answer for a technical reader. Avoid generic filler and avoid sounding like a textbook dump.\n'
+            'For definitional questions, give: (1) one-sentence definition, (2) 1-2 key mechanics or assumptions, (3) one practical note if present in context.\n'
+            'For follow-up questions, use the conversation history to resolve references.\n'
+            'Do not print raw labels like "Source titles:". End naturally with a short line starting with "Key sources:" followed by 1-3 titles only.\n'
+            'Keep the answer compact unless the user explicitly asks for detail.\n\n'
+            f'Retrieval query used: {rewritten_query}\n\n'
+            f'Context:\n{context}\n'
+            f'{history_text}\n\n'
+            f'Original user question: {query}\n'
         )
 
         payload = {
-            'model': OPENROUTER_MODEL,
+            'model': ZAI_MODEL,
             'messages': [
                 {'role': 'system', 'content': 'You answer from indexed academic paper context only.'},
                 {'role': 'user', 'content': prompt},
             ],
             'temperature': 0.2,
             'max_tokens': 700,
+            'thinking': {'type': 'disabled'},
         }
         headers = {
             'Authorization': f'Bearer {api_key}',
             'Content-Type': 'application/json',
-            'X-Title': 'Orebit Public RAG',
         }
 
         answer = None
         llm_used = True
         fallback_reason = None
         try:
-            response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=90)
+            response = requests.post(ZAI_URL, headers=headers, json=payload, timeout=90)
             response.raise_for_status()
             data = response.json()
-            answer = data['choices'][0]['message']['content']
+            msg = data['choices'][0]['message']
+            answer = msg.get('content') or msg.get('reasoning_content') or ''
         except Exception as exc:
             llm_used = False
             fallback_reason = str(exc)
@@ -706,11 +868,11 @@ class PaperRagStore:
             lead = trim(top.get('snippet') or '', 420)
             tail = trim(second.get('snippet') or '', 220) if second else ''
             pieces = [
-                f"LLM sementara tidak tersedia ({fallback_reason}).",
-                f"Dari konteks terindeks, {top.get('citation') or top.get('display_title') or top.get('title') or top.get('source') or 'sumber utama'} menunjukkan bahwa {lead}".rstrip(),
+                f"LLM temporarily unavailable ({fallback_reason}).",
+                f"From indexed context, {top.get('citation') or top.get('display_title') or top.get('title') or top.get('source') or 'primary source'} indicates that {lead}".rstrip(),
             ]
             if tail:
-                pieces.append(f"Sumber pendukung menambahkan: {tail}")
+                pieces.append(f"Supporting source adds: {tail}")
             answer = ' '.join(piece for piece in pieces if piece)
 
         return {
@@ -739,6 +901,7 @@ def main() -> int:
     p_answer = sub.add_parser('answer')
     p_answer.add_argument('--query', required=True)
     p_answer.add_argument('--top-k', type=int, default=5)
+    p_answer.add_argument('--history', type=str, default='[]')
 
     args = parser.parse_args()
     store = PaperRagStore()
@@ -754,7 +917,10 @@ def main() -> int:
         print(json.dumps(store.browse(args.page, args.limit), ensure_ascii=False))
         return 0
     if args.command == 'answer':
-        print(json.dumps(store.answer(args.query, args.top_k), ensure_ascii=False))
+        history = safe_json_load(args.history, [])
+        if not isinstance(history, list):
+            history = []
+        print(json.dumps(store.answer(args.query, args.top_k, history=history), ensure_ascii=False))
         return 0
     return 1
 

@@ -4,16 +4,19 @@ const cors = require('cors')
 const rateLimit = require('express-rate-limit')
 const { execFileSync } = require('child_process')
 const path = require('path')
+const validation = require('./validation')
 
 const app = express()
-const PORT = Number(process.env.PORT || 3004)
+const rawEnv = process.env
+const envConfig = validation.validateEnvConfig(rawEnv)
+const PORT = Number(envConfig.PORT || 3004)
 const DATA_PROVIDER = path.join(__dirname, 'rag_public_data.py')
-const STATS_TTL_MS = Number(process.env.RAG_STATS_TTL_MS || 60_000)
+const STATS_TTL_MS = Number(envConfig.RAG_STATS_TTL_MS || 60_000)
 
 app.set('trust proxy', 1)
 
 // Security: API Key (environment variable)
-const API_KEY = process.env.RAG_API_KEY || 'default-secret-key-change-me'
+const API_KEY = envConfig.RAG_API_KEY || 'default-secret-key-change-me'
 
 // Security: Rate limiting
 const limiter = rateLimit({
@@ -88,60 +91,87 @@ function getStatsCached({ force = false } = {}) {
 
 app.post('/api/rag/search', (req, res) => {
   try {
-    const { query, top_k = 5 } = req.body || {}
+    const validated = validation.validateSearchBody(req.body)
+    const { query, top_k } = validated
 
-    if (!query || String(query).trim().length === 0) {
-      return res.status(400).json({ error: 'Missing or empty query' })
-    }
-
-    const data = runProvider('search', ['--query', String(query), '--top-k', String(top_k)])
+    const data = runProvider('search', ['--query', query, '--top-k', String(top_k)])
+    // Normalize provider response to ensure type safety
+    const results = Array.isArray(data.results) ? data.results : []
+    const rawTotal = data.total
+    const total = (rawTotal != null && !isNaN(Number(rawTotal))) ? Number(rawTotal) : results.length
     return res.json({
-      query: String(query),
+      query: query,
       top_k: Number(top_k),
-      results: data.results || [],
-      total: data.total ?? (data.results || []).length,
+      results,
+      total,
     })
   } catch (err) {
     console.error('[RAG API] Search error:', err)
+    if (err.type === 'validation_error') {
+      return res.status(400).json({ error: 'Validation error', details: err.errors, message: err.message })
+    }
     return res.status(500).json({ error: 'Internal server error', message: String(err.message || err) })
   }
 })
 
 app.get('/api/rag/browse', (req, res) => {
   try {
-    const page = parseInt(req.query.page, 10) || 1
-    const limit = parseInt(req.query.limit, 10) || 20
+    const validated = validation.validateBrowseQuery(req.query)
+    const { page, limit } = validated
     const data = runProvider('browse', ['--page', String(page), '--limit', String(limit)])
-    return res.json(data)
+    // Normalize: ensure papers is an array
+    const normalized = {
+      ...data,
+      papers: Array.isArray(data.papers) ? data.papers : []
+    }
+    return res.json(normalized)
   } catch (err) {
     console.error('[RAG API] Browse error:', err)
+    if (err.type === 'validation_error') {
+      return res.status(400).json({ error: 'Validation error', details: err.errors, message: err.message })
+    }
     return res.status(500).json({ error: 'Internal server error', message: String(err.message || err) })
   }
 })
 
 app.get('/api/rag/stats', (req, res) => {
   try {
-    const force = req.query.refresh === '1'
+    const validated = validation.validateStatsQuery(req.query)
+    const { force } = validated
     const data = getStatsCached({ force })
     return res.json(data)
   } catch (err) {
     console.error('[RAG API] Stats error:', err)
+    if (err.type === 'validation_error') {
+      return res.status(400).json({ error: 'Validation error', details: err.errors, message: err.message })
+    }
     return res.status(500).json({ error: 'Internal server error', message: String(err.message || err) })
   }
 })
 
 app.post('/api/rag/answer', (req, res) => {
   try {
-    const { query, top_k = 5 } = req.body || {}
+    const validated = validation.validateAnswerBody(req.body)
+    const { query, top_k, history } = validated
 
-    if (!query || String(query).trim().length === 0) {
-      return res.status(400).json({ error: 'Missing or empty query' })
+    const args = ['--query', query, '--top-k', String(top_k)]
+    if (history && history.length > 0) {
+      args.push('--history', JSON.stringify(history))
     }
 
-    const data = runProvider('answer', ['--query', String(query), '--top-k', String(top_k)])
-    return res.json(data)
+    const data = runProvider('answer', args)
+    // Normalize response to ensure frontend safety
+    const normalized = {
+      ...data,
+      answer: typeof data.answer === 'string' ? data.answer : '',
+      sources: Array.isArray(data.sources) ? data.sources : []
+    }
+    return res.json(normalized)
   } catch (err) {
     console.error('[RAG API] Answer error:', err)
+    if (err.type === 'validation_error') {
+      return res.status(400).json({ error: 'Validation error', details: err.errors, message: err.message })
+    }
     return res.status(500).json({ error: 'Internal server error', message: String(err.message || err) })
   }
 })

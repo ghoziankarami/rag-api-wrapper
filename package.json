@@ -7,12 +7,18 @@
     "start": "node index.js",
     "dev": "node index.js"
   },
-  "keywords": ["rag", "api", "vector-db", "wrapper"],
+  "keywords": [
+    "rag",
+    "api",
+    "vector-db",
+    "wrapper"
+  ],
   "author": "Orebit",
   "license": "MIT",
   "dependencies": {
-    "express": "^4.19.2",
     "cors": "^2.8.5",
-    "express-rate-limit": "^7.2.0"
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.2.0",
+    "zod": "^4.3.6"
   }
 }
