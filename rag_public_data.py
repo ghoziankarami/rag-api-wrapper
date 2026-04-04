@@ -104,11 +104,35 @@ def trim(text: str | None, limit: int = 320) -> str:
     return clean[: limit - 1].rstrip() + '…'
 
 
+def strip_xml_tags(text: str | None) -> str:
+    if not text:
+        return ''
+    clean = str(text).replace('\r', '\n')
+    clean = re.sub(r'</?jats:[^>]+>', ' ', clean, flags=re.I)
+    clean = re.sub(r'</?[^>]+>', ' ', clean)
+    clean = re.sub(r'\s+', ' ', clean)
+    return clean.strip()
+
+
 def safe_json_load(text: str, fallback: Any = None) -> Any:
     try:
         return json.loads(text)
     except Exception:
         return fallback
+
+
+def clean_assistant_answer(text: str | None) -> str:
+    if not text:
+        return ''
+    clean = strip_xml_tags(text).replace('\r', '\n')
+    clean = clean.replace('**', '').replace('__', '').replace('`', '')
+    clean = re.sub(r'(?m)^\s*[*-]\s+', '• ', clean)
+    clean = re.sub(r'(?m)^\s*•\s*', '• ', clean)
+    clean = re.sub(r'[ \t]+\n', '\n', clean)
+    clean = re.sub(r'\n[ \t]+', '\n', clean)
+    clean = re.sub(r'[ \t]{2,}', ' ', clean)
+    clean = re.sub(r'\n{3,}', '\n\n', clean)
+    return clean.strip()
 
 
 SECTION_HEADINGS = ('abstract', 'method', 'results', 'limitations', 'next steps', 'references', 'keywords')
@@ -531,7 +555,7 @@ class SafePaperRagStore:
         return q
 
     def _clean_snippet(self, text: str | None) -> str:
-        raw = trim(text or '', 420)
+        raw = trim(strip_xml_tags(text or ''), 420)
         if not raw:
             return ''
         cleaned = raw.replace('LLM Summary:', '').replace('Objective:', '').replace('Overview', '').strip(' -:')
@@ -809,6 +833,7 @@ class SafePaperRagStore:
             'If the context is insufficient, say so plainly.\n'
             'Write a crisp, useful answer for a technical reader.\n'
             'For definitional questions, give: (1) one-sentence definition, (2) 1-2 key mechanics or assumptions, (3) one practical note if present in context.\n'
+            'Return plain text only. Do not use markdown bold markers, bullet syntax, code fences, or HTML/XML tags.\n'
             'Do not invent claims beyond the sources. End naturally with a short line starting with "Key sources:" followed by 1-3 titles only.\n\n'
             f'Retrieval query used: {rewritten_query}\n\n'
             f'Context:\n{context}\n\n'
@@ -835,7 +860,7 @@ class SafePaperRagStore:
             response.raise_for_status()
             data = response.json()
             msg = data['choices'][0]['message']
-            answer = msg.get('content') or msg.get('reasoning_content') or ''
+            answer = clean_assistant_answer(msg.get('content') or msg.get('reasoning_content') or '')
             return {
                 'query': query,
                 'answer': answer,
@@ -844,10 +869,10 @@ class SafePaperRagStore:
             }
         except Exception as exc:
             top = results[0]
-            answer = top.get('definition_snippet') or top.get('snippet') or 'Relevant metadata found, but no summary text is available.'
+            answer = clean_assistant_answer(top.get('definition_snippet') or top.get('snippet') or 'Relevant metadata found, but no summary text is available.')
             return {
                 'query': query,
-                'answer': f"{answer}\n\nKey sources: {top.get('title') or top.get('citation') or top.get('source')}",
+                'answer': clean_assistant_answer(f"{answer}\n\nKey sources: {top.get('title') or top.get('citation') or top.get('source')}"),
                 'sources': results[:top_k],
                 'llm_used': False,
                 'fallback_reason': str(exc),
@@ -1328,6 +1353,7 @@ class PaperRagStore:
             'Write a crisp, useful answer for a technical reader. Avoid generic filler and avoid sounding like a textbook dump.\n'
             'For definitional questions, give: (1) one-sentence definition, (2) 1-2 key mechanics or assumptions, (3) one practical note if present in context.\n'
             'For follow-up questions, use the conversation history to resolve references.\n'
+            'Return plain text only. Do not use markdown bold markers, bullet syntax, code fences, or HTML/XML tags.\n'
             'Do not print raw labels like "Source titles:". End naturally with a short line starting with "Key sources:" followed by 1-3 titles only.\n'
             'Keep the answer compact unless the user explicitly asks for detail.\n\n'
             f'Retrieval query used: {rewritten_query}\n\n'
@@ -1359,7 +1385,7 @@ class PaperRagStore:
             response.raise_for_status()
             data = response.json()
             msg = data['choices'][0]['message']
-            answer = msg.get('content') or msg.get('reasoning_content') or ''
+            answer = clean_assistant_answer(msg.get('content') or msg.get('reasoning_content') or '')
         except Exception as exc:
             llm_used = False
             fallback_reason = str(exc)
@@ -1373,7 +1399,7 @@ class PaperRagStore:
             ]
             if tail:
                 pieces.append(f"Supporting source adds: {tail}")
-            answer = ' '.join(piece for piece in pieces if piece)
+            answer = clean_assistant_answer(' '.join(piece for piece in pieces if piece))
 
         return {
             'query': query,
