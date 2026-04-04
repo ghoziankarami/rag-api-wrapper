@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import sys
 import warnings
 from collections import Counter, defaultdict
@@ -29,13 +30,17 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import chromadb
-from requests.exceptions import RequestsDependencyWarning
-
-warnings.filterwarnings('ignore', category=RequestsDependencyWarning)
+warnings.filterwarnings(
+    'ignore',
+    message=r".*doesn't match a supported version!.*",
+    category=Warning,
+)
 import requests
 
 WORKSPACE = Path('/root/.openclaw/workspace')
 PAPERS_DB = WORKSPACE / '.vector_db' / 'papers'
+CHROMA_SQLITE = PAPERS_DB / 'chroma.sqlite3'
+INDEX_STATE_PAPERS = PAPERS_DB / 'index_state_papers.json'
 PAPERS_COLLECTION = 'papers'
 SUMMARIES_COLLECTION = 'papers_summary'
 OBSIDIAN_PAPERS_DIR = Path('/data/obsidian/3. Resources/Papers')
@@ -353,6 +358,499 @@ def load_tracker_pending_records() -> list[dict[str, Any]]:
             'chunk_count': 0,
         })
     return records
+
+
+def load_indexed_paper_state() -> tuple[int, set[str]]:
+    if not INDEX_STATE_PAPERS.exists():
+        return 0, set()
+    try:
+        payload = json.loads(INDEX_STATE_PAPERS.read_text())
+    except Exception:
+        return 0, set()
+
+    files = payload.get('files') if isinstance(payload, dict) else {}
+    if not isinstance(files, dict):
+        return 0, set()
+    normalized = {normalize_key(name) for name in files.keys() if str(name).strip()}
+    return len(files), normalized
+
+
+def chroma_collection_embedding_count(name: str) -> int:
+    if not CHROMA_SQLITE.exists():
+        return 0
+    try:
+        conn = sqlite3.connect(str(CHROMA_SQLITE))
+        cur = conn.cursor()
+        cur.execute(
+            '''
+            select count(e.id)
+            from embeddings e
+            join segments s on e.segment_id = s.id
+            join collections c on s.collection = c.id
+            where c.name = ?
+            ''',
+            (name,),
+        )
+        row = cur.fetchone()
+        return int(row[0] or 0) if row else 0
+    except Exception:
+        return 0
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def build_tracker_active_records(indexed_keys: set[str]) -> list[dict[str, Any]]:
+    if not TRACKER_PATH.exists():
+        return []
+    try:
+        rows = json.loads(TRACKER_PATH.read_text())
+    except Exception:
+        return []
+
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get('corpus_state') != 'active':
+            continue
+        meta = row.get('metadata') or {}
+        source = (
+            row.get('filename')
+            or row.get('storage_location')
+            or row.get('title')
+            or row.get('id')
+            or 'Untitled'
+        )
+        title = normalize_title_text(meta.get('title') or row.get('title') or Path(str(source)).stem)
+        authors_list = parse_author_list(row.get('authors') or meta.get('authors'))
+        citation = build_apa_citation(title, authors_list or row.get('authors') or meta.get('authors'), meta.get('year'))
+        indexed = normalize_key(str(source)) in indexed_keys
+        abstract = trim(meta.get('abstract') or '', 520)
+        tags = ', '.join(str(tag) for tag in (row.get('tags') or [])[:4] if str(tag).strip())
+        venue = normalize_title_text(row.get('journal') or meta.get('venue') or meta.get('publication'))
+        snippet = abstract
+        if not snippet:
+            snippet_parts = []
+            if venue:
+                snippet_parts.append(f'Venue: {venue}.')
+            if tags:
+                snippet_parts.append(f'Tags: {tags}.')
+            snippet = ' '.join(snippet_parts) or 'Metadata record available for this paper.'
+        records.append({
+            'id': normalize_key(row.get('doi') or source or row.get('id')),
+            'source': source,
+            'title': title,
+            'display_title': citation,
+            'citation': citation,
+            'authors': format_apa_authors(authors_list) or normalize_title_text(', '.join(authors_list) if authors_list else row.get('authors')),
+            'authors_list': authors_list,
+            'year': meta.get('year'),
+            'doi': row.get('doi') or meta.get('doi'),
+            'snippet': snippet,
+            'kind': 'paper' if indexed else 'metadata',
+            'chunk_count': 1 if indexed else 0,
+            'chunk_count_estimated': indexed,
+            'indexed_fulltext': indexed,
+            'has_summary': False,
+            'url': row.get('url'),
+            'source_ref': row.get('url'),
+            'project': row.get('project'),
+            'journal': venue,
+        })
+    return records
+
+
+class SafePaperRagStore:
+    def __init__(self):
+        self._cache: dict[str, Any] = {}
+
+    def _tokens(self, text: str) -> list[str]:
+        raw = [tok.lower() for tok in TOKEN_RE.findall(text or '') if len(tok) > 1]
+        filtered = [tok for tok in raw if tok not in STOPWORDS]
+        if not filtered:
+            filtered = raw
+        expanded = []
+        for tok in filtered:
+            expanded.extend(TERM_EXPANSIONS.get(tok, [tok]))
+        seen = []
+        for tok in expanded:
+            if tok not in seen:
+                seen.append(tok)
+        return seen
+
+    def _score_text(self, query_tokens: list[str], fields: list[str]) -> float:
+        if not query_tokens:
+            return 0.0
+        scored = 0.0
+        matched_tokens = 0
+        joined = ' \n '.join(fields).lower()
+        title = fields[0].lower() if fields else ''
+        source = fields[-1].lower() if fields else ''
+        for token in query_tokens:
+            freq = joined.count(token)
+            if not freq:
+                continue
+            matched_tokens += 1
+            weight = 1.0
+            if token in title:
+                weight += 3.0
+            if token in source:
+                weight += 3.5
+            scored += min(6.0, freq) * weight
+        if not matched_tokens:
+            return 0.0
+        coverage = matched_tokens / len(query_tokens)
+        phrase = ' '.join(query_tokens)
+        if phrase and phrase in joined:
+            scored += 5.0
+        if phrase and phrase in title:
+            scored += 8.0
+        if phrase and phrase in source:
+            scored += 6.0
+        denom = max(10.0, len(query_tokens) * 7.0)
+        raw_score = min(0.99, scored / denom)
+        return round(raw_score * (0.4 + 0.6 * coverage), 4)
+
+    def _rewrite_followup_query(self, query: str, history: list | None = None) -> str:
+        q = (query or '').strip()
+        if not q or not history:
+            return q
+        if not any(tok in FOLLOWUP_PRONOUNS for tok in [t.lower() for t in TOKEN_RE.findall(q)]):
+            return q
+        for msg in reversed(history[-6:]):
+            if msg.get('role') != 'user':
+                continue
+            prev = str(msg.get('content') or '').strip()
+            if not prev or prev == q:
+                continue
+            prev_tokens = self._tokens(prev)
+            if len(prev_tokens) < 2:
+                continue
+            return f"{q} (context: {prev})"
+        return q
+
+    def _clean_snippet(self, text: str | None) -> str:
+        raw = trim(text or '', 420)
+        if not raw:
+            return ''
+        cleaned = raw.replace('LLM Summary:', '').replace('Objective:', '').replace('Overview', '').strip(' -:')
+        cleaned = re.sub(r'\[\[[^\]]+\]\]', '', cleaned)
+        cleaned = re.sub(r'(Related Concepts|Citation|Indexed|Source)\s*:?.*', '', cleaned, flags=re.I)
+        cleaned = re.sub(r'\b(Related Concepts|Citation|Indexed|Source)\b.*', '', cleaned, flags=re.I)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip(' -:;,.')
+        return cleaned
+
+    def _extract_definition_line(self, text: str | None, query_tokens: list[str]) -> str:
+        cleaned = self._clean_snippet(text)
+        if not cleaned:
+            return ''
+        sentences = re.split(r'(?<=[.!?])\s+', cleaned)
+        priority = []
+        for s in sentences:
+            s2 = s.strip()
+            low = s2.lower()
+            if any(tok in low for tok in query_tokens) and any(key in low for key in [' is ', ' are ', ' refers to ', ' defined as ', ' method', ' interpolation', ' technique']):
+                priority.append(s2)
+        if priority:
+            return trim(priority[0], 260)
+        return trim(sentences[0] if sentences else cleaned, 260)
+
+    def _rerank_candidates(self, query: str, candidates: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
+        q = (query or '').strip().lower()
+        q_tokens = self._tokens(q)
+        reranked = []
+        for item in candidates:
+            score = float(item.get('score') or 0.0)
+            chunk_count = int(item.get('chunk_count') or 0)
+            title = str(item.get('title') or '').lower()
+            snippet = str(item.get('snippet') or '').lower()
+            kind = str(item.get('kind') or '').lower()
+            year_text = str(item.get('year') or '')
+            year_val = int(year_text) if year_text.isdigit() else 0
+            if kind == 'paper':
+                score += 0.10
+            if chunk_count > 0:
+                score += 0.22
+            else:
+                score -= 0.10
+            title_hits = sum(1 for tok in q_tokens if tok in title)
+            score += min(0.24, title_hits * 0.08)
+            if q.startswith('what is') or q.startswith('what are'):
+                if any(key in snippet for key in [' is ', ' are ', 'refers to', 'defined as', 'interpolation', 'geostatistical method']):
+                    score += 0.10
+            if len(snippet) > 180:
+                score += 0.03
+            if year_val and year_val <= 2010:
+                score += 0.02
+            clean_snippet = self._clean_snippet(item.get('snippet') or '')
+            definition_snippet = self._extract_definition_line(item.get('snippet') or '', q_tokens)
+            reranked.append({
+                **item,
+                'score': round(min(0.99, score), 4),
+                'snippet': clean_snippet,
+                'definition_snippet': definition_snippet,
+            })
+        reranked.sort(key=lambda item: (item['score'], int(str(item.get('year') or 0)) if str(item.get('year') or '').isdigit() else 0), reverse=True)
+        return reranked[:top_k]
+
+    def summary_index(self) -> dict[str, dict[str, Any]]:
+        if 'summary_index' in self._cache:
+            return self._cache['summary_index']
+        index: dict[str, dict[str, Any]] = {}
+        if OBSIDIAN_PAPERS_DIR.exists():
+            for note_path in OBSIDIAN_PAPERS_DIR.glob('*.md'):
+                record = extract_note_record(note_path)
+                if not record:
+                    continue
+                index[record['id']] = record
+        self._cache['summary_index'] = index
+        return index
+
+    def papers(self) -> list[dict[str, Any]]:
+        if 'papers' in self._cache:
+            return self._cache['papers']
+
+        indexed_count, indexed_keys = load_indexed_paper_state()
+        summary_map = self.summary_index()
+        papers: dict[str, dict[str, Any]] = {}
+
+        for record in build_tracker_active_records(indexed_keys):
+            papers[record['id']] = record
+
+        for key, summary in summary_map.items():
+            if key in papers:
+                existing = papers[key]
+                merged = {
+                    **existing,
+                    'title': summary.get('title') or existing.get('title'),
+                    'display_title': summary.get('display_title') or existing.get('display_title'),
+                    'citation': summary.get('citation') or existing.get('citation'),
+                    'authors': summary.get('authors') or existing.get('authors'),
+                    'authors_list': summary.get('authors_list') or existing.get('authors_list'),
+                    'year': summary.get('year') or existing.get('year'),
+                    'doi': summary.get('doi') or existing.get('doi'),
+                    'snippet': summary.get('snippet') or existing.get('snippet'),
+                    'has_summary': True,
+                }
+                papers[key] = merged
+                continue
+            papers[key] = {
+                'id': key,
+                'source': summary.get('source'),
+                'title': summary.get('title') or Path(str(summary.get('source') or key)).stem,
+                'display_title': summary.get('display_title') or build_apa_citation(summary.get('title') or Path(str(summary.get('source') or key)).stem, summary.get('authors_list') or summary.get('authors'), summary.get('year')),
+                'citation': summary.get('citation') or build_apa_citation(summary.get('title') or Path(str(summary.get('source') or key)).stem, summary.get('authors_list') or summary.get('authors'), summary.get('year')),
+                'authors': summary.get('authors'),
+                'authors_list': summary.get('authors_list') or parse_author_list(summary.get('authors')),
+                'year': summary.get('year'),
+                'doi': summary.get('doi'),
+                'snippet': summary.get('snippet') or '',
+                'kind': 'summary',
+                'chunk_count': 0,
+                'chunk_count_estimated': False,
+                'indexed_fulltext': False,
+                'has_summary': True,
+                'url': summary.get('url') or summary.get('source_ref'),
+                'source_ref': summary.get('source_ref') or summary.get('url'),
+            }
+
+        for pending in load_tracker_pending_records():
+            pending_doi = str((pending.get('doi') or '')).lower()
+            pending_key = pending.get('id')
+            existing = papers.get(pending_key)
+            if existing:
+                continue
+            if pending_doi and any(str((p.get('doi') or '')).lower() == pending_doi for p in papers.values()):
+                continue
+            papers[pending_key] = pending
+
+        ordered = sorted(
+            papers.values(),
+            key=lambda row: (
+                0 if row.get('indexed_fulltext') else 1,
+                0 if row.get('has_summary') else 1,
+                0 if row.get('kind') == 'paper' else 1,
+                -(int(str(row.get('year') or 0)) if str(row.get('year') or '').isdigit() else 0),
+                str(row.get('title') or '').lower(),
+            ),
+        )
+        self._cache['papers'] = ordered
+        self._cache['indexed_count'] = indexed_count
+        return ordered
+
+    def stats(self) -> dict[str, Any]:
+        papers = self.papers()
+        indexed_count = int(self._cache.get('indexed_count') or load_indexed_paper_state()[0])
+        summary_count = len(self.summary_index())
+        chunk_count = chroma_collection_embedding_count(PAPERS_COLLECTION)
+        metadata_only_records = len([p for p in papers if not p.get('indexed_fulltext')])
+        return {
+            'status': 'ok',
+            'service': 'rag-api-wrapper',
+            'version': '2.0.1-safe',
+            'mode': 'public_read_only',
+            'indexed_papers': indexed_count,
+            'paper_count': indexed_count,
+            'fulltext_papers': indexed_count,
+            'metadata_only_records': metadata_only_records,
+            'summary_count': summary_count,
+            'collection_count': chunk_count,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'llm_ready': bool(os.getenv('ZAI_API_KEY') or os.getenv('OPENCLAW_MODELS_PROVIDERS_ZAI_APIKEY')),
+            'fallback_mode': 'tracker_sqlite_safe',
+        }
+
+    def search(self, query: str, top_k: int = 10, history: list | None = None) -> list[dict[str, Any]]:
+        q = self._rewrite_followup_query((query or '').strip(), history)
+        if not q:
+            return []
+        tokens = self._tokens(q)
+        if not tokens:
+            return []
+
+        candidates = []
+        for paper in self.papers():
+            fields = [
+                str(paper.get('title') or ''),
+                str(paper.get('authors') or ''),
+                str(paper.get('year') or ''),
+                str(paper.get('snippet') or ''),
+                str(paper.get('source') or ''),
+                str(paper.get('project') or ''),
+                str(paper.get('journal') or ''),
+            ]
+            score = self._score_text(tokens, fields)
+            if score <= 0:
+                continue
+            candidates.append({
+                'id': paper['id'],
+                'source': paper.get('source'),
+                'title': paper.get('title') or Path(str(paper.get('source') or paper['id'])).stem,
+                'display_title': paper.get('display_title') or build_apa_citation(paper.get('title') or Path(str(paper.get('source') or paper['id'])).stem, paper.get('authors_list') or paper.get('authors'), paper.get('year')),
+                'citation': paper.get('citation') or build_apa_citation(paper.get('title') or Path(str(paper.get('source') or paper['id'])).stem, paper.get('authors_list') or paper.get('authors'), paper.get('year')),
+                'authors': paper.get('authors'),
+                'authors_list': paper.get('authors_list') or parse_author_list(paper.get('authors')),
+                'year': paper.get('year'),
+                'doi': paper.get('doi'),
+                'snippet': paper.get('snippet') or '',
+                'score': round(score, 4),
+                'kind': paper.get('kind'),
+                'chunk_count': paper.get('chunk_count', 0),
+                'chunk_count_estimated': bool(paper.get('chunk_count_estimated')),
+                'indexed_fulltext': bool(paper.get('indexed_fulltext')),
+                'has_summary': paper.get('has_summary', False),
+            })
+
+        deduped: dict[str, dict[str, Any]] = {}
+        for item in candidates:
+            key = normalize_key(item.get('source') or item.get('title') or item['id'])
+            existing = deduped.get(key)
+            if not existing or item['score'] > existing['score']:
+                deduped[key] = item
+
+        reranked = self._rerank_candidates(q, list(deduped.values()), top_k=max(top_k * 2, 10))
+        return reranked[:top_k]
+
+    def browse(self, page: int = 1, limit: int = 24) -> dict[str, Any]:
+        page = max(1, int(page or 1))
+        limit = max(1, min(100, int(limit or 24)))
+        papers = self.papers()
+        total = len(papers)
+        start = (page - 1) * limit
+        end = start + limit
+        return {
+            'page': page,
+            'limit': limit,
+            'total': total,
+            'hasMore': end < total,
+            'papers': papers[start:end],
+        }
+
+    def answer(self, query: str, top_k: int = 5, history: list | None = None) -> dict[str, Any]:
+        rewritten_query = self._rewrite_followup_query(query, history)
+        results = self.search(rewritten_query, top_k=max(3, min(8, top_k)), history=history)
+        if not results:
+            return {
+                'query': query,
+                'answer': 'No relevant papers found in the public index for that query.',
+                'sources': [],
+                'llm_used': False,
+            }
+
+        context_parts = []
+        for item in results[:top_k]:
+            source_line = item.get('citation') or item.get('display_title') or item.get('title') or item.get('source') or 'Unknown source'
+            best_snippet = item.get('definition_snippet') or item.get('snippet') or '—'
+            context_parts.append(
+                f"[Source: {source_line}]\n"
+                f"Authors: {item.get('authors') or '—'}\n"
+                f"Year: {item.get('year') or '—'}\n"
+                f"DOI: {item.get('doi') or '—'}\n"
+                f"Evidence: {best_snippet}"
+            )
+        context = '\n\n---\n\n'.join(context_parts)
+
+        api_key = os.getenv('ZAI_API_KEY') or os.getenv('OPENCLAW_MODELS_PROVIDERS_ZAI_APIKEY')
+        if not api_key:
+            top = results[0]
+            answer = top.get('definition_snippet') or top.get('snippet') or 'Relevant metadata found, but no summary text is available.'
+            return {
+                'query': query,
+                'answer': f"{answer}\n\nKey sources: {top.get('title') or top.get('citation') or top.get('source')}",
+                'sources': results[:top_k],
+                'llm_used': False,
+            }
+
+        prompt = (
+            'You are the public Orebit RAG assistant.\n'
+            'Answer using ONLY the provided paper context.\n'
+            'If the context is insufficient, say so plainly.\n'
+            'Write a crisp, useful answer for a technical reader.\n'
+            'For definitional questions, give: (1) one-sentence definition, (2) 1-2 key mechanics or assumptions, (3) one practical note if present in context.\n'
+            'Do not invent claims beyond the sources. End naturally with a short line starting with "Key sources:" followed by 1-3 titles only.\n\n'
+            f'Retrieval query used: {rewritten_query}\n\n'
+            f'Context:\n{context}\n\n'
+            f'Original user question: {query}\n'
+        )
+
+        payload = {
+            'model': ZAI_MODEL,
+            'messages': [
+                {'role': 'system', 'content': 'You answer from indexed academic paper context only.'},
+                {'role': 'user', 'content': prompt},
+            ],
+            'temperature': 0.2,
+            'max_tokens': 700,
+            'thinking': {'type': 'disabled'},
+        }
+        headers = {
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+        }
+
+        try:
+            response = requests.post(ZAI_URL, headers=headers, json=payload, timeout=90)
+            response.raise_for_status()
+            data = response.json()
+            msg = data['choices'][0]['message']
+            answer = msg.get('content') or msg.get('reasoning_content') or ''
+            return {
+                'query': query,
+                'answer': answer,
+                'sources': results[:top_k],
+                'llm_used': True,
+            }
+        except Exception as exc:
+            top = results[0]
+            answer = top.get('definition_snippet') or top.get('snippet') or 'Relevant metadata found, but no summary text is available.'
+            return {
+                'query': query,
+                'answer': f"{answer}\n\nKey sources: {top.get('title') or top.get('citation') or top.get('source')}",
+                'sources': results[:top_k],
+                'llm_used': False,
+                'fallback_reason': str(exc),
+            }
 
 
 class PaperRagStore:
@@ -904,7 +1402,7 @@ def main() -> int:
     p_answer.add_argument('--history', type=str, default='[]')
 
     args = parser.parse_args()
-    store = PaperRagStore()
+    store = SafePaperRagStore()
 
     if args.command == 'stats':
         print(json.dumps(store.stats(), ensure_ascii=False))
