@@ -185,6 +185,7 @@ app.get('/api/rag/health', (req, res) => {
       version: stats.version || '2.0.0',
       timestamp: new Date().toISOString(),
       mode: stats.mode || 'public_read_only',
+      llm_model: stats.llm_model || null,
       llm_ready: Boolean(stats.llm_ready),
       corpus: {
         indexed_papers: stats.indexed_papers || 0,

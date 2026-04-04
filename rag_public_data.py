@@ -45,7 +45,7 @@ PAPERS_COLLECTION = 'papers'
 SUMMARIES_COLLECTION = 'papers_summary'
 OBSIDIAN_PAPERS_DIR = Path('/data/obsidian/3. Resources/Papers')
 TRACKER_PATH = WORKSPACE / 'research' / 'paper-tracker' / 'papers.json'
-ZAI_MODEL = os.getenv('ZAI_MODEL', 'glm-4.7')
+ZAI_MODEL = os.getenv('ZAI_MODEL', 'glm-4.7-flash')
 ZAI_URL = os.getenv('ZAI_URL', 'https://api.z.ai/api/coding/paas/v4/chat/completions')
 
 FOLLOWUP_PRONOUNS = {
@@ -690,6 +690,7 @@ class SafePaperRagStore:
             'service': 'rag-api-wrapper',
             'version': '2.0.1-safe',
             'mode': 'public_read_only',
+            'llm_model': ZAI_MODEL,
             'indexed_papers': indexed_count,
             'paper_count': indexed_count,
             'fulltext_papers': indexed_count,
@@ -1053,6 +1054,7 @@ class PaperRagStore:
             'service': 'rag-api-wrapper',
             'version': '2.0.0',
             'mode': 'public_read_only',
+            'llm_model': ZAI_MODEL,
             'indexed_papers': len(papers),
             'paper_count': fulltext_papers,
             'fulltext_papers': fulltext_papers,
