@@ -28,6 +28,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import quote
 
 import chromadb
 warnings.filterwarnings(
@@ -309,6 +310,57 @@ def parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     return meta, body
 
 
+def extract_markdown_section(body: str, heading: str) -> str:
+    if not body:
+        return ''
+    pattern = re.compile(
+        rf'^\s*##\s+{re.escape(heading)}\s*$([\s\S]*?)(?=^\s*##\s+|\Z)',
+        re.I | re.M,
+    )
+    match = pattern.search(body)
+    if not match:
+        return ''
+    section = match.group(1).strip()
+    section = re.sub(r'(?m)^\s*[-*]\s+', '• ', section)
+    return strip_xml_tags(section)
+
+
+def extract_key_findings(body: str) -> list[str]:
+    if not body:
+        return []
+    pattern = re.compile(
+        r'^\s*##\s+Key Findings\s*$([\s\S]*?)(?=^\s*##\s+|\Z)',
+        re.I | re.M,
+    )
+    match = pattern.search(body)
+    if not match:
+        return []
+    section = match.group(1).strip()
+    findings = []
+    for line in section.splitlines():
+        clean = line.strip()
+        if not clean:
+            continue
+        clean = re.sub(r'^\s*[-*\u2022]\s*', '', clean)
+        clean = re.sub(r'^\[[^\]]+\]\s*', '', clean)
+        clean = strip_xml_tags(clean)
+        clean = trim(clean, 220)
+        if clean:
+            findings.append(clean)
+        if len(findings) >= 3:
+            break
+    return findings
+
+
+def build_obsidian_uri(path: Path) -> str | None:
+    try:
+        relative = path.relative_to(Path('/data/obsidian'))
+    except Exception:
+        return None
+    relative_text = str(relative).replace('\\', '/')
+    return f"obsidian://open?vault=obsidian&file={quote(relative_text, safe='/')}"
+
+
 def extract_note_record(path: Path) -> dict[str, Any] | None:
     try:
         raw = path.read_text(encoding='utf-8', errors='ignore')
@@ -328,6 +380,14 @@ def extract_note_record(path: Path) -> dict[str, Any] | None:
     citation = build_apa_citation(title, authors_list or authors, year)
     source = meta.get('source') or path.name
     key = normalize_key(source or title or path.stem)
+    overview = extract_markdown_section(body, 'Overview')
+    significance = extract_markdown_section(body, 'Significance')
+    note_summary = trim(overview or significance or snippet, 900)
+    relative_path = None
+    try:
+        relative_path = str(path.relative_to(Path('/data/obsidian'))).replace('\\', '/')
+    except Exception:
+        relative_path = path.name
     return {
         'id': key,
         'source': source,
@@ -339,10 +399,48 @@ def extract_note_record(path: Path) -> dict[str, Any] | None:
         'year': year,
         'doi': doi,
         'snippet': snippet,
+        'obsidian_summary': note_summary,
+        'obsidian_key_findings': extract_key_findings(body),
+        'obsidian_note_path': relative_path,
+        'obsidian_uri': build_obsidian_uri(path),
         'kind': 'summary',
         'generated_at': int(path.stat().st_mtime),
         'from_obsidian_note': True,
     }
+
+
+def find_matching_summary(record: dict[str, Any], summary_map: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    if not summary_map:
+        return None
+
+    candidates = [
+        normalize_key(record.get('id')),
+        normalize_key(record.get('doi')),
+        normalize_key(record.get('source')),
+        normalize_key(record.get('title')),
+        normalize_key(Path(str(record.get('source') or '')).stem),
+    ]
+
+    for candidate in candidates:
+        if candidate and candidate in summary_map:
+            return summary_map[candidate]
+
+    record_doi = normalize_key(record.get('doi'))
+    record_title = normalize_key(record.get('title'))
+    record_source_stem = normalize_key(Path(str(record.get('source') or '')).stem)
+
+    for summary in summary_map.values():
+        summary_doi = normalize_key(summary.get('doi'))
+        summary_title = normalize_key(summary.get('title'))
+        summary_source_stem = normalize_key(Path(str(summary.get('source') or '')).stem)
+        if record_doi and summary_doi and record_doi == summary_doi:
+            return summary
+        if record_title and summary_title and record_title == summary_title:
+            return summary
+        if record_source_stem and summary_source_stem and record_source_stem == summary_source_stem:
+            return summary
+
+    return None
 
 
 def load_tracker_pending_records() -> list[dict[str, Any]]:
@@ -655,6 +753,11 @@ class SafePaperRagStore:
                     'year': summary.get('year') or existing.get('year'),
                     'doi': summary.get('doi') or existing.get('doi'),
                     'snippet': summary.get('snippet') or existing.get('snippet'),
+                    'obsidian_summary': summary.get('obsidian_summary') or existing.get('obsidian_summary'),
+                    'obsidian_key_findings': summary.get('obsidian_key_findings') or existing.get('obsidian_key_findings'),
+                    'obsidian_note_path': summary.get('obsidian_note_path') or existing.get('obsidian_note_path'),
+                    'obsidian_uri': summary.get('obsidian_uri') or existing.get('obsidian_uri'),
+                    'from_obsidian_note': bool(summary.get('from_obsidian_note') or existing.get('from_obsidian_note')),
                     'has_summary': True,
                 }
                 papers[key] = merged
@@ -670,6 +773,11 @@ class SafePaperRagStore:
                 'year': summary.get('year'),
                 'doi': summary.get('doi'),
                 'snippet': summary.get('snippet') or '',
+                'obsidian_summary': summary.get('obsidian_summary'),
+                'obsidian_key_findings': summary.get('obsidian_key_findings') or [],
+                'obsidian_note_path': summary.get('obsidian_note_path'),
+                'obsidian_uri': summary.get('obsidian_uri'),
+                'from_obsidian_note': bool(summary.get('from_obsidian_note')),
                 'kind': 'summary',
                 'chunk_count': 0,
                 'chunk_count_estimated': False,
@@ -677,6 +785,28 @@ class SafePaperRagStore:
                 'has_summary': True,
                 'url': summary.get('url') or summary.get('source_ref'),
                 'source_ref': summary.get('source_ref') or summary.get('url'),
+            }
+
+        for key, paper in list(papers.items()):
+            summary = find_matching_summary(paper, summary_map)
+            if not summary:
+                continue
+            papers[key] = {
+                **paper,
+                'title': summary.get('title') or paper.get('title'),
+                'display_title': summary.get('display_title') or paper.get('display_title'),
+                'citation': summary.get('citation') or paper.get('citation'),
+                'authors': summary.get('authors') or paper.get('authors'),
+                'authors_list': summary.get('authors_list') or paper.get('authors_list'),
+                'year': summary.get('year') or paper.get('year'),
+                'doi': summary.get('doi') or paper.get('doi'),
+                'snippet': summary.get('snippet') or paper.get('snippet'),
+                'obsidian_summary': summary.get('obsidian_summary') or paper.get('obsidian_summary'),
+                'obsidian_key_findings': summary.get('obsidian_key_findings') or paper.get('obsidian_key_findings') or [],
+                'obsidian_note_path': summary.get('obsidian_note_path') or paper.get('obsidian_note_path'),
+                'obsidian_uri': summary.get('obsidian_uri') or paper.get('obsidian_uri'),
+                'from_obsidian_note': bool(summary.get('from_obsidian_note') or paper.get('from_obsidian_note')),
+                'has_summary': True,
             }
 
         for pending in load_tracker_pending_records():
@@ -759,6 +889,11 @@ class SafePaperRagStore:
                 'year': paper.get('year'),
                 'doi': paper.get('doi'),
                 'snippet': paper.get('snippet') or '',
+                'obsidian_summary': paper.get('obsidian_summary'),
+                'obsidian_key_findings': paper.get('obsidian_key_findings') or [],
+                'obsidian_note_path': paper.get('obsidian_note_path'),
+                'obsidian_uri': paper.get('obsidian_uri'),
+                'from_obsidian_note': bool(paper.get('from_obsidian_note')),
                 'score': round(score, 4),
                 'kind': paper.get('kind'),
                 'chunk_count': paper.get('chunk_count', 0),
@@ -999,21 +1134,27 @@ class PaperRagStore:
 
         for chunk in chunks:
             key = normalize_key(chunk['source'])
+            summary = find_matching_summary(chunk, summary_map) or {}
             if key not in papers:
                 papers[key] = {
                     'id': key,
                     'source': chunk['source'],
-                    'title': chunk['title'],
-                    'display_title': chunk.get('display_title') or build_apa_citation(chunk['title'], chunk.get('authors_list') or chunk.get('authors'), chunk.get('year')),
-                    'citation': chunk.get('citation') or build_apa_citation(chunk['title'], chunk.get('authors_list') or chunk.get('authors'), chunk.get('year')),
-                    'authors': chunk.get('authors'),
-                    'authors_list': chunk.get('authors_list') or parse_author_list(chunk.get('authors')),
-                    'year': chunk.get('year'),
-                    'doi': chunk.get('doi'),
-                    'snippet': chunk.get('snippet') or '',
+                    'title': summary.get('title') or chunk['title'],
+                    'display_title': summary.get('display_title') or chunk.get('display_title') or build_apa_citation(chunk['title'], chunk.get('authors_list') or chunk.get('authors'), chunk.get('year')),
+                    'citation': summary.get('citation') or chunk.get('citation') or build_apa_citation(chunk['title'], chunk.get('authors_list') or chunk.get('authors'), chunk.get('year')),
+                    'authors': summary.get('authors') or chunk.get('authors'),
+                    'authors_list': summary.get('authors_list') or chunk.get('authors_list') or parse_author_list(chunk.get('authors')),
+                    'year': summary.get('year') or chunk.get('year'),
+                    'doi': summary.get('doi') or chunk.get('doi'),
+                    'snippet': summary.get('snippet') or chunk.get('snippet') or '',
+                    'obsidian_summary': summary.get('obsidian_summary'),
+                    'obsidian_key_findings': summary.get('obsidian_key_findings') or [],
+                    'obsidian_note_path': summary.get('obsidian_note_path'),
+                    'obsidian_uri': summary.get('obsidian_uri'),
+                    'from_obsidian_note': bool(summary.get('from_obsidian_note')),
                     'kind': 'paper',
                     'chunk_count': 1,
-                    'has_summary': key in summary_map,
+                    'has_summary': bool(summary),
                 }
             else:
                 papers[key]['chunk_count'] += 1
@@ -1039,6 +1180,11 @@ class PaperRagStore:
                 'year': summary.get('year'),
                 'doi': summary.get('doi'),
                 'snippet': summary.get('snippet') or '',
+                'obsidian_summary': summary.get('obsidian_summary'),
+                'obsidian_key_findings': summary.get('obsidian_key_findings') or [],
+                'obsidian_note_path': summary.get('obsidian_note_path'),
+                'obsidian_uri': summary.get('obsidian_uri'),
+                'from_obsidian_note': bool(summary.get('from_obsidian_note')),
                 'kind': 'summary',
                 'chunk_count': 0,
                 'has_summary': True,
