@@ -856,6 +856,7 @@ class SafePaperRagStore:
         peer = parity.get('peer_reviewed') or {}
         arxiv = parity.get('arxiv') or {}
         rag = parity.get('rag') or {}
+        download_outcomes = peer.get('download_outcomes') or {}
         return {
             'status': 'ok',
             'service': 'rag-api-wrapper',
@@ -872,6 +873,13 @@ class SafePaperRagStore:
             'peer_reviewed_gdrive_pdfs': peer.get('active_gdrive_pdfs'),
             'peer_reviewed_obsidian_notes': peer.get('obsidian_summary_notes'),
             'parity_gap': peer.get('parity_gap'),
+            'download_outcomes': download_outcomes,
+            'download_attempted': download_outcomes.get('attempted'),
+            'downloaded_success_count': download_outcomes.get('downloaded'),
+            'blocked_403_count': download_outcomes.get('blocked_403'),
+            'resolved_html_only_count': download_outcomes.get('resolved_html_only'),
+            'manual_download_needed_count': download_outcomes.get('manual_download_needed'),
+            'other_download_failure_count': download_outcomes.get('other_download_failure'),
             'arxiv_violations': arxiv.get('tracker_downloaded_policy_violations'),
             'arxiv_workspace_rag': arxiv.get('workspace_rag_entries', rag.get('arxiv_workspace_rag')),
             'timestamp': datetime.now(timezone.utc).isoformat(),
@@ -1247,6 +1255,7 @@ class PaperRagStore:
         peer = parity.get('peer_reviewed') or {}
         arxiv = parity.get('arxiv') or {}
         rag = parity.get('rag') or {}
+        download_outcomes = peer.get('download_outcomes') or {}
         return {
             'status': 'ok',
             'service': 'rag-api-wrapper',
@@ -1263,6 +1272,13 @@ class PaperRagStore:
             'peer_reviewed_gdrive_pdfs': peer.get('active_gdrive_pdfs'),
             'peer_reviewed_obsidian_notes': peer.get('obsidian_summary_notes'),
             'parity_gap': peer.get('parity_gap'),
+            'download_outcomes': download_outcomes,
+            'download_attempted': download_outcomes.get('attempted'),
+            'downloaded_success_count': download_outcomes.get('downloaded'),
+            'blocked_403_count': download_outcomes.get('blocked_403'),
+            'resolved_html_only_count': download_outcomes.get('resolved_html_only'),
+            'manual_download_needed_count': download_outcomes.get('manual_download_needed'),
+            'other_download_failure_count': download_outcomes.get('other_download_failure'),
             'arxiv_violations': arxiv.get('tracker_downloaded_policy_violations'),
             'arxiv_workspace_rag': arxiv.get('workspace_rag_entries', rag.get('arxiv_workspace_rag')),
             'timestamp': datetime.now(timezone.utc).isoformat(),
