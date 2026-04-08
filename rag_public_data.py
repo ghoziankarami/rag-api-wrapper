@@ -45,6 +45,7 @@ INDEX_STATE_PAPERS = PAPERS_DB / 'index_state_papers.json'
 PAPERS_COLLECTION = 'papers'
 SUMMARIES_COLLECTION = 'papers_summary'
 OBSIDIAN_PAPERS_DIR = Path('/data/obsidian/3. Resources/Papers')
+ACTIVE_PDF_ROOT = Path('/mnt/gdrive/AI_Knowledge')
 TRACKER_PATH = WORKSPACE / 'research' / 'paper-tracker' / 'papers.json'
 PAPER_PARITY_STATE = WORKSPACE / '.state' / 'paper_count_parity.json'
 ZAI_MODEL = os.getenv('ZAI_MODEL', 'glm-4.7-flash')
@@ -503,8 +504,10 @@ def load_indexed_paper_state() -> tuple[int, set[str]]:
     files = payload.get('files') if isinstance(payload, dict) else {}
     if not isinstance(files, dict):
         return 0, set()
-    normalized = {normalize_key(name) for name in files.keys() if str(name).strip()}
-    return len(files), normalized
+    active_pdf_names = {p.name for p in ACTIVE_PDF_ROOT.glob('*.pdf')} if ACTIVE_PDF_ROOT.exists() else set()
+    filtered_names = [name for name in files.keys() if str(name).strip() and (not active_pdf_names or str(name) in active_pdf_names)]
+    normalized = {normalize_key(name) for name in filtered_names}
+    return len(filtered_names), normalized
 
 
 def chroma_collection_embedding_count(name: str) -> int:
