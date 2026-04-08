@@ -46,6 +46,7 @@ PAPERS_COLLECTION = 'papers'
 SUMMARIES_COLLECTION = 'papers_summary'
 OBSIDIAN_PAPERS_DIR = Path('/data/obsidian/3. Resources/Papers')
 TRACKER_PATH = WORKSPACE / 'research' / 'paper-tracker' / 'papers.json'
+PAPER_PARITY_STATE = WORKSPACE / '.state' / 'paper_count_parity.json'
 ZAI_MODEL = os.getenv('ZAI_MODEL', 'glm-4.7-flash')
 ZAI_URL = os.getenv('ZAI_URL', 'https://api.z.ai/api/coding/paas/v4/chat/completions')
 
@@ -86,6 +87,15 @@ TERM_EXPANSIONS = {
     'geostatistics': ['geostatistics', 'geostatistic', 'kriging', 'variogram'],
     'interpolation': ['interpolation', 'interpolate', 'kriging', 'spatial'],
 }
+
+
+def load_paper_parity_state() -> dict[str, Any]:
+    if not PAPER_PARITY_STATE.exists():
+        return {}
+    try:
+        return json.loads(PAPER_PARITY_STATE.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
 
 
 def normalize_key(value: str | None) -> str:
@@ -839,6 +849,10 @@ class SafePaperRagStore:
         summary_count = len(self.summary_index())
         chunk_count = chroma_collection_embedding_count(PAPERS_COLLECTION)
         metadata_only_records = len([p for p in papers if not p.get('indexed_fulltext')])
+        parity = load_paper_parity_state()
+        peer = parity.get('peer_reviewed') or {}
+        arxiv = parity.get('arxiv') or {}
+        rag = parity.get('rag') or {}
         return {
             'status': 'ok',
             'service': 'rag-api-wrapper',
@@ -851,6 +865,12 @@ class SafePaperRagStore:
             'metadata_only_records': metadata_only_records,
             'summary_count': summary_count,
             'collection_count': chunk_count,
+            'peer_reviewed_ok': parity.get('status') == 'PASS',
+            'peer_reviewed_gdrive_pdfs': peer.get('active_gdrive_pdfs'),
+            'peer_reviewed_obsidian_notes': peer.get('obsidian_summary_notes'),
+            'parity_gap': peer.get('parity_gap'),
+            'arxiv_violations': arxiv.get('tracker_downloaded_policy_violations'),
+            'arxiv_workspace_rag': arxiv.get('workspace_rag_entries', rag.get('arxiv_workspace_rag')),
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'llm_ready': bool(os.getenv('ZAI_API_KEY') or os.getenv('OPENCLAW_MODELS_PROVIDERS_ZAI_APIKEY')),
             'fallback_mode': 'tracker_sqlite_safe',
@@ -1220,6 +1240,10 @@ class PaperRagStore:
         chunk_count = self.count(PAPERS_COLLECTION)
         fulltext_papers = len([p for p in papers if (p.get('chunk_count') or 0) > 0])
         metadata_only_records = len([p for p in papers if (p.get('chunk_count') or 0) == 0])
+        parity = load_paper_parity_state()
+        peer = parity.get('peer_reviewed') or {}
+        arxiv = parity.get('arxiv') or {}
+        rag = parity.get('rag') or {}
         return {
             'status': 'ok',
             'service': 'rag-api-wrapper',
@@ -1232,6 +1256,12 @@ class PaperRagStore:
             'metadata_only_records': metadata_only_records,
             'summary_count': summary_count,
             'collection_count': chunk_count,
+            'peer_reviewed_ok': parity.get('status') == 'PASS',
+            'peer_reviewed_gdrive_pdfs': peer.get('active_gdrive_pdfs'),
+            'peer_reviewed_obsidian_notes': peer.get('obsidian_summary_notes'),
+            'parity_gap': peer.get('parity_gap'),
+            'arxiv_violations': arxiv.get('tracker_downloaded_policy_violations'),
+            'arxiv_workspace_rag': arxiv.get('workspace_rag_entries', rag.get('arxiv_workspace_rag')),
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'llm_ready': bool(os.getenv('ZAI_API_KEY') or os.getenv('OPENCLAW_MODELS_PROVIDERS_ZAI_APIKEY')),
         }
