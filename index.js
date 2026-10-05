@@ -1,4 +1,5 @@
-require('dotenv').config()
+const envPath = require('path').join(__dirname, '.env')
+if (require('fs').existsSync(envPath)) process.loadEnvFile(envPath)
 const express = require('express')
 const cors = require('cors')
 const rateLimit = require('express-rate-limit')
@@ -216,3 +217,4 @@ app.listen(PORT, '127.0.0.1', () => {
   console.log('[RAG API] Security: API key validation ENABLED')
   console.log('[RAG API] Security: Rate limiting ENABLED (100 req/min)')
 })
+
