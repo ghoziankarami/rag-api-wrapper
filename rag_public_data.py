@@ -12,7 +12,7 @@ Data sources:
 The search strategy is intentionally simple and reliable:
 - keyword scoring over titles, authors, summaries, and paper chunks
 - real corpus data only (no synthetic fixtures)
-- LLM answers via OpenRouter when an API key is available
+- LLM answers via the configured Z.ai provider when an API key is available
 """
 
 from __future__ import annotations
@@ -38,16 +38,16 @@ warnings.filterwarnings(
 )
 import requests
 
-WORKSPACE = Path('/root/.openclaw/workspace')
-PAPERS_DB = WORKSPACE / '.vector_db' / 'papers'
+WORKSPACE = Path(os.getenv('RAG_WORKSPACE', '/root/.openclaw/workspace')).expanduser()
+PAPERS_DB = Path(os.getenv('RAG_PAPERS_DB', str(WORKSPACE / '.vector_db' / 'papers'))).expanduser()
 CHROMA_SQLITE = PAPERS_DB / 'chroma.sqlite3'
 INDEX_STATE_PAPERS = PAPERS_DB / 'index_state_papers.json'
 PAPERS_COLLECTION = 'papers'
 SUMMARIES_COLLECTION = 'papers_summary'
-OBSIDIAN_PAPERS_DIR = Path('/data/obsidian/3. Resources/Papers')
-ACTIVE_PDF_ROOT = Path('/mnt/gdrive/AI_Knowledge')
-TRACKER_PATH = WORKSPACE / 'research' / 'paper-tracker' / 'papers.json'
-PAPER_PARITY_STATE = WORKSPACE / '.state' / 'paper_count_parity.json'
+OBSIDIAN_PAPERS_DIR = Path(os.getenv('RAG_OBSIDIAN_PAPERS_DIR', '/data/obsidian/3. Resources/Papers')).expanduser()
+ACTIVE_PDF_ROOT = Path(os.getenv('RAG_ACTIVE_PDF_ROOT', '/mnt/gdrive/AI_Knowledge')).expanduser()
+TRACKER_PATH = Path(os.getenv('RAG_TRACKER_PATH', str(WORKSPACE / 'research' / 'paper-tracker' / 'papers.json'))).expanduser()
+PAPER_PARITY_STATE = Path(os.getenv('RAG_PARITY_STATE', str(WORKSPACE / '.state' / 'paper_count_parity.json'))).expanduser()
 ZAI_MODEL = os.getenv('ZAI_MODEL', 'glm-4.7-flash')
 ZAI_URL = os.getenv('ZAI_URL', 'https://api.z.ai/api/coding/paas/v4/chat/completions')
 
